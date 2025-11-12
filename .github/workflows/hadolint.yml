@@ -1,0 +1,85 @@
+name: Hadolint
+
+on:
+  push:
+    branches:
+      - main
+      - feat/*
+  pull_request:
+    branches: [ "main" ]
+  schedule:
+    - cron: '28 22 * * 1'
+
+permissions:
+  contents: read
+
+jobs:
+  hadolint:
+    name: Run hadolint recursively
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read         
+      security-events: write
+      actions: read          
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Find and lint all Dockerfiles
+        run: |
+          # Create a directory to store SARIF results
+          mkdir -p hadolint-results
+          
+          # Find all files named 'Dockerfile' (case-insensitive)
+          # -type f: Only find files
+          # -iname "Dockerfile": Find by name, case-insensitive
+          for file in $(find . -type f -iname "Dockerfile"); do
+            echo "Linting $file"
+            
+            # Run hadolint in a Docker container
+            # --rm: Automatically remove the container when it exits
+            # -i: Run in interactive mode to pipe input from the file
+            # < "$file": Redirects the content of the found file into the container
+            # --format sarif: Tells hadolint to output in SARIF format
+            # > "...": Redirects the SARIF output to a unique file
+            # || true: This is important! If hadolint finds errors, it
+            #         exits with a non-zero code. This '|| true' ensures
+            #         the step doesn't fail, allowing the loop to continue
+            #         and all Dockerfiles to be linted.
+            docker run --rm -i hadolint/hadolint < "$file" \
+              --format sarif > "hadolint-results/$(basename $file).sarif" || true
+          done
+
+      - name: Merge SARIF results
+        run: |
+          # This shell option makes globs expand to nothing if no files match
+          # instead of expanding to the literal string pattern.
+          shopt -s nullglob
+
+          # Create a bash array of all found .sarif files
+          files=(hadolint-results/*.sarif)
+
+          # Check if the number of files (#) in the array (@) is greater than 0
+          if [ ${#files[@]} -gt 0 ]; then
+            # If files exist, merge them all using jq
+            # -s (slurp): Reads all input JSONs into one big array
+            # map(.runs): For each file's JSON, get its 'runs' array
+            # | add: Concatenates the array of arrays into a single 'runs' array
+            # "${files[@]}": Safely passes all found filenames to jq
+            jq -s '{ "version": "2.1.0", "runs": map(.runs) | add }' "${files[@]}" > hadolint-results/all.sarif
+          else
+            # If no .sarif files were found, create a minimal, valid, empty
+            # SARIF file so the upload step doesn't fail.
+            echo "No SARIF files found, creating empty results file."
+            echo '{ "version": "2.1.0", "runs": [] }' > hadolint-results/all.sarif
+          fi
+
+      - name: Upload all SARIF results to GitHub
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          # Path to the final SARIF file to upload
+          sarif_file: hadolint-results/all.sarif
+          # Wait for GitHub to finish processing the file before
+          # marking the job as complete.
+          wait-for-processing: true
